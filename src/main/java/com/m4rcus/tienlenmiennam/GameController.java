@@ -1,20 +1,25 @@
 package com.m4rcus.tienlenmiennam;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.ResponseBody;
 import org.springframework.web.context.annotation.SessionScope;
 
 @Controller
 @SessionScope
 public class GameController {
+    private boolean justPlayed; // Chỉ true khi vừa có người đánh bài mới xuống bàn
 
     private List<CardPlayer> players;
     private Rule.Move currentTableMove; // Lưu bộ bài hiện tại trên bàn
@@ -30,6 +35,7 @@ public class GameController {
     }
 
     private void startNewGame() {
+        justPlayed = false;
         Deck deck = new Deck();
         deck.shuffle();
         players = new ArrayList<>();
@@ -71,6 +77,7 @@ public class GameController {
         }
         return 0;
     }
+
     private boolean containsThreeOfSpades(List<Card> cards) {
         for (Card c : cards) {
             if (c.getFace().equals("3") && c.getSuit().equals("Spades")) {
@@ -83,6 +90,7 @@ public class GameController {
     // Endpoint cho 1 Bot thực hiện lượt đánh của mình
     @RequestMapping("/bot-step")
     public String botStep() {
+        justPlayed = false;
         if (winner != null || !players.get(currentTurn).isBot()) {
             return "redirect:/";
         }
@@ -90,7 +98,8 @@ public class GameController {
         CardPlayer bot = players.get(currentTurn);
         Rule.Move botMove = TienLenBotAI.chooseBestMove(bot.getHand(), currentTableMove);
 
-        // Nếu là lượt đầu tiên của ván và Bot cầm 3 Bích, đảm bảo nước đi của Bot có chứa 3 Bích
+        // Nếu là lượt đầu tiên của ván và Bot cầm 3 Bích, đảm bảo nước đi của Bot có
+        // chứa 3 Bích
         if (isFirstTurn && botMove != null && !containsThreeOfSpades(botMove.cards)) {
             botMove = Rule.identifyMove(List.of(bot.getHand().get(0))); // Lá đầu tiên sau khi sort luôn là 3 Bích
         }
@@ -115,11 +124,13 @@ public class GameController {
         model.addAttribute("message", message);
         model.addAttribute("winner", winner);
         model.addAttribute("logs", logs);
+        model.addAttribute("justPlayed", justPlayed); // Truyền cờ này sang index.html
         return "index"; // Trỏ tới file index.html
     }
 
     @PostMapping("/play")
     public String playCards(@RequestParam(value = "selectedIndices", required = false) List<Integer> indices) {
+        justPlayed = false;
         if (winner != null || currentTurn != 0)
             return "redirect:/";
         if (indices == null || indices.isEmpty()) {
@@ -147,6 +158,7 @@ public class GameController {
 
     @PostMapping("/pass")
     public String passTurn() {
+        justPlayed = false;
         if (winner != null || currentTurn != 0)
             return "redirect:/";
         if (currentTableMove == null) {
@@ -172,6 +184,7 @@ public class GameController {
         p.removeCard(move.cards);
         currentTableMove = move;
         lastPlayedBy = playerIdx;
+        justPlayed = true;
         message = p.getName() + " đánh [" + formatComboName(move.type) + "]: " + move.cards;
         addLog(message);
         if (p.getHand().isEmpty()) {
@@ -200,7 +213,6 @@ public class GameController {
         } while (players.get(currentTurn).isPassed());
     }
 
-
     private String formatComboName(Rule.ComboType type) {
         return switch (type) {
             case SINGLE -> "Rác";
@@ -212,6 +224,113 @@ public class GameController {
             case FOUR_PAIR -> "4 đôi thông";
             default -> "";
         };
+    }
+
+    // Gom toàn bộ trạng thái bàn đấu thành JSON
+    private Map<String, Object> buildGameState() {
+        Map<String, Object> state = new HashMap<>();
+        state.put("players", players);
+        state.put("tableCards", currentTableMove != null ? currentTableMove.cards : List.of());
+        state.put("lastPlayedPlayer", players.get(lastPlayedBy).getName());
+        state.put("currentTurn", currentTurn);
+        state.put("isBotTurn", winner == null && players.get(currentTurn).isBot());
+        state.put("message", message);
+        state.put("winner", winner);
+        state.put("logs", logs);
+        state.put("justPlayed", justPlayed);
+        return state;
+    }
+
+    @GetMapping("/api/state")
+    @ResponseBody
+    public Map<String, Object> getState() {
+        justPlayed = false;
+        return buildGameState();
+    }
+
+    @PostMapping("/api/play")
+    @ResponseBody
+    public Map<String, Object> apiPlay(@RequestBody List<Integer> indices) {
+        justPlayed = false;
+        if (winner != null || currentTurn != 0)
+            return buildGameState();
+        if (indices == null || indices.isEmpty()) {
+            message = "Bạn chưa chọn lá bài nào!";
+            return buildGameState();
+        }
+
+        CardPlayer human = players.get(0);
+        List<Card> selectedCards = new ArrayList<>();
+        for (int idx : indices) {
+            if (idx >= 0 && idx < human.getHand().size()) {
+                selectedCards.add(human.getHand().get(idx));
+            }
+        }
+
+        if (isFirstTurn && !containsThreeOfSpades(selectedCards)) {
+            message = "Lượt đầu tiên bắt buộc phải đánh bộ bài có chứa lá 3 Bích!";
+            return buildGameState();
+        }
+
+        Rule.Move move = Rule.identifyMove(selectedCards);
+        if (!Rule.canBeat(currentTableMove, move)) {
+            message = "Nước đi không hợp lệ hoặc không chặt được bài trên bàn!";
+            return buildGameState();
+        }
+
+        executeMove(0, move);
+        return buildGameState();
+    }
+
+    @PostMapping("/api/pass")
+    @ResponseBody
+    public Map<String, Object> apiPass() {
+        justPlayed = false;
+        if (winner != null || currentTurn != 0)
+            return buildGameState();
+        if (currentTableMove == null) {
+            message = "Bạn đang được đi vòng mới, không thể bỏ lượt!";
+            return buildGameState();
+        }
+
+        players.get(0).setPassed(true);
+        message = "Bạn đã bỏ lượt.";
+        addLog(message);
+        advanceTurn();
+        return buildGameState();
+    }
+
+    @PostMapping("/api/bot-step")
+    @ResponseBody
+    public Map<String, Object> apiBotStep() {
+        justPlayed = false;
+        if (winner != null || !players.get(currentTurn).isBot())
+            return buildGameState();
+
+        CardPlayer bot = players.get(currentTurn);
+        Rule.Move botMove = TienLenBotAI.chooseBestMove(bot.getHand(), currentTableMove);
+
+        if (isFirstTurn && botMove != null && !containsThreeOfSpades(botMove.cards)) {
+            botMove = Rule.identifyMove(List.of(bot.getHand().get(0)));
+        }
+
+        if (botMove != null) {
+            executeMove(currentTurn, botMove);
+        } else {
+            bot.setPassed(true);
+            message = bot.getName() + " bỏ lượt.";
+            addLog(message);
+            advanceTurn();
+        }
+        return buildGameState();
+    }
+
+    @PostMapping("/api/reset")
+    @ResponseBody
+    public Map<String, Object> apiReset() {
+        startNewGame();
+        justPlayed = false;
+        return buildGameState();
     }
 
 }
